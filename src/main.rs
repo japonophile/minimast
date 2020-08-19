@@ -11,7 +11,8 @@ pub struct Scope {
 pub struct Program {
     pub n_stmt: u32,
     pub constants: HashMap<String, u32>,
-    pub variables: HashMap<String, u32>
+    pub variables: HashMap<String, u32>,
+    pub labels: HashMap<String, u32>
 }
 
 pub struct ParserState {
@@ -88,6 +89,9 @@ fn parse_constant(bytes: &[u8], mut state: ParserState) -> Result<ParserState, S
     if state.program.variables.contains_key(&constant) {
         return Err(format!("Constant {} was previously defined as a variable", constant));
     }
+    if state.program.labels.contains_key(&constant) {
+        return Err(format!("Constant {} matches an existing label", constant));
+    }
     state.program.constants.insert(constant, state.program.constants.len() as u32);
     Ok(state)
 }
@@ -106,6 +110,9 @@ fn parse_variable(bytes: &[u8], mut state: ParserState) -> Result<ParserState, S
     if state.program.constants.contains_key(&variable) {
         return Err(format!("Variable {} matches an existing constant", variable));
     }
+    if state.program.labels.contains_key(&variable) {
+        return Err(format!("Variable {} matches an existing label", variable));
+    }
     let v: u32;
     if state.program.variables.contains_key(&variable) {
         v = state.program.variables[&variable];
@@ -121,9 +128,9 @@ fn parse_variable(bytes: &[u8], mut state: ParserState) -> Result<ParserState, S
     Ok(state)
 }
 
-fn parse_label(bytes: &[u8], start: usize) -> Result<(usize, String), String> {
-    let mut j = start;
-    let i = &mut j;
+fn parse_label(bytes: &[u8], mut state: ParserState) -> Result<(ParserState, u32), String> {
+    let i = &mut state.i;
+    let start = *i;
     loop {
         check_bytes_left!(i, bytes);
         let c = char::from(bytes[*i]);
@@ -134,12 +141,22 @@ fn parse_label(bytes: &[u8], start: usize) -> Result<(usize, String), String> {
         *i += 1;
     }
     let label = String::from_utf8(bytes[start .. *i].to_vec()).expect("Cannot convert to string");
-    Ok((*i, label))
+    if state.program.labels.contains_key(&label) {
+        return Err(format!("Label {} was already defined before", label));
+    }
+    if state.program.constants.contains_key(&label) {
+        return Err(format!("Label {} matches a constant", label));
+    }
+    if state.program.variables.contains_key(&label) {
+        return Err(format!("Label {} matches a variable", label));
+    }
+    let l = state.program.labels.len() as u32;
+    state.program.labels.insert(label, l);
+    Ok((state, l))
 }
 
-fn parse_comment(bytes: &[u8], start: usize) -> Result<usize, String> {
-    let mut j = start;
-    let i = &mut j;
+fn parse_comment(bytes: &[u8], mut start: usize) -> Result<usize, String> {
+    let i = &mut start;
     loop {
         check_bytes_left!(i, bytes);
         if bytes[*i] == '$' as u8 {
@@ -206,13 +223,13 @@ fn parse_xxx_stmt(bytes: &[u8], mut state: ParserState) -> Result<ParserState, S
 }
 
 fn parse_labeled_stmt(bytes: &[u8], mut state: ParserState) -> Result<ParserState, String> {
-    let i = &mut state.i;
-    let label: String;
+    let mut i = &mut state.i;
+    let label: u32;
 
     *i = skip_blanks(bytes, *i);
     check_bytes_left!(i, bytes);
-    match parse_label(bytes, *i) {
-        Ok((ni, l)) => { label = l; *i = ni },
+    match parse_label(bytes, state) {
+        Ok((ns, l)) => { state = ns; i = &mut state.i; label = l },
         Err(e) => return Err(e)
     }
     // println!("{}", label);
@@ -363,7 +380,8 @@ fn parse_metamath(filename: &str) -> Result<(), String> {
         program: Program {
             n_stmt: 0,
             constants: HashMap::new(),
-            variables: HashMap::new()
+            variables: HashMap::new(),
+            labels: HashMap::new()
         },
         scope: Scope {
             variables: HashSet::new()
@@ -378,7 +396,8 @@ fn parse_metamath(filename: &str) -> Result<(), String> {
             state = ns;
             // println!("Constants: {:?}", state.program.constants.keys())
             println!("{} constants", state.program.constants.len());
-            println!("{} variables", state.program.variables.len())
+            println!("{} variables", state.program.variables.len());
+            println!("{} labels", state.program.labels.len())
         },
         Err(e) => println!("Error: {}", e)
     }
