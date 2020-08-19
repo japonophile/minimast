@@ -1,16 +1,31 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::time::Instant;
 
+pub struct Scope {
+    pub variables: HashSet<u32>
+}
+
 pub struct Program {
     pub n_stmt: u32,
-    pub constants: HashMap<String, u32>
+    pub constants: HashMap<String, u32>,
+    pub variables: HashMap<String, u32>
 }
 
 pub struct ParserState {
     pub i: usize,
-    pub program: Program
+    pub program: Program,
+    pub scope: Scope
+}
+
+impl Clone for Scope {
+    fn clone(&self) -> Scope {
+        Scope {
+            variables: self.variables.clone()
+        }
+    }
 }
 
 macro_rules! check_bytes_left {
@@ -70,7 +85,39 @@ fn parse_constant(bytes: &[u8], mut state: ParserState) -> Result<ParserState, S
     if state.program.constants.contains_key(&constant) {
         return Err(format!("Constant {} was already defined before", constant));
     }
+    if state.program.variables.contains_key(&constant) {
+        return Err(format!("Constant {} was previously defined as a variable", constant));
+    }
     state.program.constants.insert(constant, state.program.constants.len() as u32);
+    Ok(state)
+}
+
+fn parse_variable(bytes: &[u8], mut state: ParserState) -> Result<ParserState, String> {
+    let i = &mut state.i;
+    let start = *i;
+    loop {
+        check_bytes_left!(i, bytes);
+        if !is_math_symbol(bytes[*i]) {
+            break
+        }
+        *i += 1;
+    }
+    let variable = String::from_utf8(bytes[start .. *i].to_vec()).expect("Cannot convert to string");
+    if state.program.constants.contains_key(&variable) {
+        return Err(format!("Variable {} matches an existing constant", variable));
+    }
+    let v: u32;
+    if state.program.variables.contains_key(&variable) {
+        v = state.program.variables[&variable];
+        if state.scope.variables.contains(&v) {
+            return Err(format!("Variable {} was already defined before", variable));
+        }
+    }
+    else {
+        v = state.program.variables.len() as u32;
+        state.program.variables.insert(variable, v);
+    }
+    state.scope.variables.insert(v);
     Ok(state)
 }
 
@@ -89,8 +136,6 @@ fn parse_label(bytes: &[u8], start: usize) -> Result<(usize, String), String> {
     let label = String::from_utf8(bytes[start .. *i].to_vec()).expect("Cannot convert to string");
     Ok((*i, label))
 }
-
-
 
 fn parse_comment(bytes: &[u8], start: usize) -> Result<usize, String> {
     let mut j = start;
@@ -113,7 +158,7 @@ fn parse_comment(bytes: &[u8], start: usize) -> Result<usize, String> {
     Ok(*i)
 }
 
-fn parse_constant_stmt(bytes: &[u8], mut state: ParserState) -> Result<ParserState, String> {
+fn parse_const_var_stmt(bytes: &[u8], parse_element: fn(&[u8], ParserState) -> Result<ParserState, String>, mut state: ParserState) -> Result<ParserState, String> {
     state.program.n_stmt += 1;
     let mut i = &mut state.i;
     loop {
@@ -132,7 +177,7 @@ fn parse_constant_stmt(bytes: &[u8], mut state: ParserState) -> Result<ParserSta
             }
         }
         else {
-            match parse_constant(bytes, state) {
+            match parse_element(bytes, state) {
                 Ok(ns) => { state = ns; i = &mut state.i },
                 Err(e) => return Err(e)
             }
@@ -220,12 +265,15 @@ fn parse_stmt(bytes: &[u8], mut state: ParserState) -> Result<ParserState, Strin
             skip_comment!(i, bytes);
             if bytes[*i] == '{' as u8 {
                 *i += 1;
-                return parse_block(bytes, state);
+                let original_scope = state.scope.clone();
+                match parse_block(bytes, state) {
+                    Ok(mut ns) => { ns.scope = original_scope; return Ok(ns) },
+                    Err(e) => return Err(e)
+                }
             }
             if bytes[*i] == 'v' as u8 {
                 *i += 1;
-                // parse variable statement
-                return parse_xxx_stmt(bytes, state);
+                return parse_const_var_stmt(bytes, parse_variable, state);
             }
             else if bytes[*i] == 'd' as u8 {
                 *i += 1;
@@ -279,7 +327,7 @@ fn parse_top_level(bytes: &[u8], mut state: ParserState) -> Result<ParserState, 
             skip_comment!(i, bytes);
             if bytes[*i] == 'c' as u8 {
                 *i += 1;
-                match parse_constant_stmt(bytes, state) {
+                match parse_const_var_stmt(bytes, parse_constant, state) {
                     Ok(ns) => { state = ns; i = &mut state.i },
                     Err(e) => return Err(e)
                 }
@@ -287,8 +335,9 @@ fn parse_top_level(bytes: &[u8], mut state: ParserState) -> Result<ParserState, 
             }
             else if bytes[*i] == '{' as u8 {
                 *i += 1;
+                let original_scope = state.scope.clone();
                 match parse_block(bytes, state) {
-                    Ok(ns) => { state = ns; i = &mut state.i },
+                    Ok(ns) => { state = ns; state.scope = original_scope; i = &mut state.i },
                     Err(e) => return Err(e)
                 }
                 continue
@@ -313,7 +362,11 @@ fn parse_metamath(filename: &str) -> Result<(), String> {
         i: 0,
         program: Program {
             n_stmt: 0,
-            constants: HashMap::new()
+            constants: HashMap::new(),
+            variables: HashMap::new()
+        },
+        scope: Scope {
+            variables: HashSet::new()
         }
     };
     print!("Reading source file \"{}\"... ", filename);
@@ -324,7 +377,8 @@ fn parse_metamath(filename: &str) -> Result<(), String> {
         Ok(ns) => {
             state = ns;
             // println!("Constants: {:?}", state.program.constants.keys())
-            println!("{} constants", state.program.constants.len())
+            println!("{} constants", state.program.constants.len());
+            println!("{} variables", state.program.variables.len())
         },
         Err(e) => println!("Error: {}", e)
     }
