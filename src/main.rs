@@ -33,22 +33,10 @@ impl Clone for Scope {
     }
 }
 
-macro_rules! check_bytes_left {
+macro_rules! require_another_byte {
     ($b:ident) => {
         if $b.i >= $b.bytes.len() {
             return Err("Unexpected EOS".to_string())
-        }
-    }
-}
-
-macro_rules! skip_comment {
-    ($b:ident) => {
-        if $b.bytes[$b.i] as char == '(' {
-            $b.i += 1;
-            match parse_comment($b) {
-                Ok(()) => continue,
-                Err(e) => return Err(e)
-            }
         }
     }
 }
@@ -65,6 +53,63 @@ fn skip_blanks(b: &mut ParseBuffer) {
     }
 }
 
+enum Token {
+    StartBlock,
+    EndBlock,
+    StartConstant,
+    StartVariable,
+    StartFloating,
+    StartEssential,
+    StartDisjoint,
+    StartAxiom,
+    StartProvable,
+    StartProof,
+    EndStatement,
+    Other,
+    Empty
+}
+
+fn get_token(b: &mut ParseBuffer, allow_empty: bool) -> Result<Token, String> {
+    loop {
+        if allow_empty && b.i >= b.bytes.len() {
+            return Ok(Token::Empty)
+        }
+        require_another_byte!(b);
+        if b.bytes[b.i] as char == '$' {
+            b.i += 1;
+            require_another_byte!(b);
+            let c = b.bytes[b.i] as char;
+            b.i += 1;
+            match c {
+                '(' => match parse_comment(b) {
+                    Ok(()) => { skip_blanks(b); continue },
+                    Err(e) => return Err(e) },
+                '{' => return Ok(Token::StartBlock),
+                '}' => return Ok(Token::EndBlock),
+                'c' => return Ok(Token::StartConstant),
+                'v' => return Ok(Token::StartVariable),
+                'f' => return Ok(Token::StartFloating),
+                'e' => return Ok(Token::StartEssential),
+                'd' => return Ok(Token::StartDisjoint),
+                'a' => return Ok(Token::StartAxiom),
+                'p' => return Ok(Token::StartProvable),
+                '=' => return Ok(Token::StartProof),
+                '.' => return Ok(Token::EndStatement),
+                _ => return Err(format!("Unexpected token ${}", c))
+            }
+        }
+        return Ok(Token::Other)
+    }
+}
+
+fn get_next_token(b: &mut ParseBuffer) -> Result<Token, String> {
+    return get_token(b, false)
+}
+
+fn get_optional_token(b: &mut ParseBuffer) -> Result<Token, String> {
+    return get_token(b, true)
+}
+
 fn is_math_symbol(byte: u8) -> bool {
     return byte >= 0x21 && byte <= 0x7e && byte != '$' as u8
 }
@@ -72,7 +117,7 @@ fn is_math_symbol(byte: u8) -> bool {
 fn parse_constant(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
     let start = b.i;
     loop {
-        check_bytes_left!(b);
+        require_another_byte!(b);
         if !is_math_symbol(b.bytes[b.i]) {
             break
         }
@@ -95,7 +140,7 @@ fn parse_constant(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserS
 fn parse_variable(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
     let start = b.i;
     loop {
-        check_bytes_left!(b);
+        require_another_byte!(b);
         if !is_math_symbol(b.bytes[b.i]) {
             break
         }
@@ -126,8 +171,8 @@ fn parse_variable(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserS
 fn parse_label(b: &mut ParseBuffer, mut state: ParserState) -> Result<(ParserState, u32), String> {
     let start = b.i;
     loop {
-        check_bytes_left!(b);
-        let c = char::from(b.bytes[b.i]);
+        require_another_byte!(b);
+        let c = b.bytes[b.i] as char;
         if !c.is_ascii_alphanumeric() &&
            c != '.' && c != '-' && c != '_' {
             break
@@ -151,10 +196,10 @@ fn parse_label(b: &mut ParseBuffer, mut state: ParserState) -> Result<(ParserSta
 
 fn parse_comment(b: &mut ParseBuffer) -> Result<(), String> {
     loop {
-        check_bytes_left!(b);
+        require_another_byte!(b);
         if b.bytes[b.i] as char == '$' {
             b.i += 1;
-            check_bytes_left!(b);
+            require_another_byte!(b);
             if b.bytes[b.i] as char == '(' {
                 return Err("Comments may not be nested".to_string())
             }
@@ -172,24 +217,14 @@ fn parse_const_var_stmt(b: &mut ParseBuffer, parse_element: fn(&mut ParseBuffer,
     state.program.n_stmt += 1;
     loop {
         skip_blanks(b);
-        check_bytes_left!(b);
-        if b.bytes[b.i] as char == '$' {
-            b.i += 1;
-            check_bytes_left!(b);
-            skip_comment!(b);
-            if b.bytes[b.i] as char == '.' {
-                b.i += 1;
-                break
-            }
-            else {
-                return Err(format!("Unexpected token ${}", b.bytes[b.i] as char))
-            }
-        }
-        else {
-            match parse_element(b, state) {
-                Ok(ns) => state = ns,
+        match get_next_token(b) {
+            Ok(Token::EndStatement) => break,
+            Ok(Token::Other) => match parse_element(b, state) {
+                Ok(ns) => { state = ns; continue },
                 Err(e) => return Err(e)
-            }
+            },
+            Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
+            Err(e) => return Err(e)
         }
     }
     Ok(state)
@@ -198,16 +233,11 @@ fn parse_const_var_stmt(b: &mut ParseBuffer, parse_element: fn(&mut ParseBuffer,
 fn parse_xxx_stmt(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
     loop {
         skip_blanks(b);
-        check_bytes_left!(b);
-        if b.bytes[b.i] as char == '$' {
-            b.i += 1;
-            check_bytes_left!(b);
-            if b.bytes[b.i] as char == '.' {
-                b.i += 1;
-                break
-            }
+        match get_next_token(b) {
+            Ok(Token::EndStatement) => break,
+            Err(e) => return Err(e),
+            _ => b.i += 1  // TODO
         }
-        b.i += 1;
     }
     state.program.n_stmt += 1;
     Ok(state)
@@ -217,101 +247,56 @@ fn parse_labeled_stmt(b: &mut ParseBuffer, mut state: ParserState) -> Result<Par
     let label: u32;
 
     skip_blanks(b);
-    check_bytes_left!(b);
+    require_another_byte!(b);
     match parse_label(b, state) {
         Ok((ns, l)) => { state = ns; label = l },
         Err(e) => return Err(e)
     }
-    // println!("{}", label);
+    // println!("{} ({})", label, b.i);
 
     loop {
         skip_blanks(b);
-        check_bytes_left!(b);
-        if b.bytes[b.i] as char == '$' {
-            b.i += 1;
-            check_bytes_left!(b);
-            skip_comment!(b);
-            if b.bytes[b.i] as char == 'f' {
-                b.i += 1;
-                // parse floating statement
-                return parse_xxx_stmt(b, state);
-            }
-            else if b.bytes[b.i] as char == 'e' {
-                b.i += 1;
-                // parse essential statement
-                return parse_xxx_stmt(b, state);
-            }
-            else if b.bytes[b.i] as char == 'a' {
-                b.i += 1;
-                // parse axiom statement
-                return parse_xxx_stmt(b, state);
-            }
-            else if b.bytes[b.i] as char == 'p' {
-                b.i += 1;
-                // parse provable statement
-                return parse_xxx_stmt(b, state);
-            }
-            else {
-                return Err(format!("Unexpected token ${}", b.bytes[b.i] as char))
-            }
-        }
-        else {
-            return Err(format!("Unexpected token {}", b.bytes[b.i] as char))
+        match get_next_token(b) {
+            Ok(Token::StartFloating) => return parse_xxx_stmt(b, state),
+            Ok(Token::StartEssential) => return parse_xxx_stmt(b, state),
+            Ok(Token::StartAxiom) => return parse_xxx_stmt(b, state),
+            Ok(Token::StartProvable) => return parse_xxx_stmt(b, state),
+            Ok(Token::Other) => return Err(format!("Unexpected token {}", b.bytes[b.i] as char)),
+            Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
+            Err(e) => return Err(e)
         }
     }
 }
 
 fn parse_stmt(b: &mut ParseBuffer, state: ParserState) -> Result<ParserState, String> {
-    loop {
-        skip_blanks(b);
-        check_bytes_left!(b);
-        if b.bytes[b.i] as char == '$' {
-            b.i += 1;
-            check_bytes_left!(b);
-            skip_comment!(b);
-            if b.bytes[b.i] as char == '{' {
-                b.i += 1;
-                let original_scope = state.scope.clone();
-                match parse_block(b, state) {
-                    Ok(mut ns) => { ns.scope = original_scope; return Ok(ns) },
-                    Err(e) => return Err(e)
-                }
-            }
-            if b.bytes[b.i] as char == 'v' {
-                b.i += 1;
-                return parse_const_var_stmt(b, parse_variable, state);
-            }
-            else if b.bytes[b.i] as char == 'd' {
-                b.i += 1;
-                // parse disjoint statement
-                return parse_xxx_stmt(b, state);
-            }
-            else {
-                b.i -= 1;
-            }
-        }
-        return parse_labeled_stmt(b, state);
+    skip_blanks(b);
+    match get_next_token(b) {
+        Ok(Token::StartBlock) => {
+            let original_scope = state.scope.clone();
+            match parse_block(b, state) {
+                Ok(mut ns) => { ns.scope = original_scope; return Ok(ns) },
+                Err(e) => return Err(e)
+            } },
+        Ok(Token::StartVariable) => return parse_const_var_stmt(b, parse_variable, state),
+        Ok(Token::StartDisjoint) => return parse_xxx_stmt(b, state),
+        Ok(Token::Other) => {},
+        Ok(_) => b.i -= 2,  // rewind parsed token
+        Err(e) => return Err(e),
     }
+    return parse_labeled_stmt(b, state)
 }
 
 fn parse_block(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
     loop {
         skip_blanks(b);
-        check_bytes_left!(b);
-        if b.bytes[b.i] as char == '$' {
-            b.i += 1;
-            check_bytes_left!(b);
-            skip_comment!(b);
-            if b.bytes[b.i] as char == '}' {
-                b.i += 1;
-                break
-            }
-            else {
-                b.i -= 1;
-            }
+        match get_next_token(b) {
+            Ok(Token::EndBlock) => break,
+            Ok(Token::Other) => {},
+            Ok(_) => b.i -= 2,  // rewind parsed token
+            Err(e) => return Err(e),
         }
         match parse_stmt(b, state) {
-            Ok(ns) => state = ns,
+            Ok(ns) => { state = ns; continue },
             Err(e) => return Err(e)
         }
     }
@@ -322,36 +307,17 @@ fn parse_block(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserStat
 fn parse_top_level(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
     loop {
         skip_blanks(b);
-        if b.i >= b.bytes.len() {
-            break
-        }
-        if b.bytes[b.i] as char == '$' {
-            b.i += 1;
-            check_bytes_left!(b);
-            skip_comment!(b);
-            if b.bytes[b.i] as char == 'c' {
-                b.i += 1;
-                match parse_const_var_stmt(b, parse_constant, state) {
-                    Ok(ns) => state = ns,
-                    Err(e) => return Err(e)
-                }
-                continue
-            }
-            else if b.bytes[b.i] as char == '{' {
-                b.i += 1;
-                let original_scope = state.scope.clone();
-                match parse_block(b, state) {
-                    Ok(ns) => { state = ns; state.scope = original_scope },
-                    Err(e) => return Err(e)
-                }
-                continue
-            }
-            else {
-                b.i -= 1;
-            }
+        match get_optional_token(b) {
+            Ok(Token::StartConstant) => match parse_const_var_stmt(b, parse_constant, state) {
+                Ok(ns) => { state = ns; continue },
+                Err(e) => return Err(e) },
+            Ok(Token::Other) => {},
+            Ok(Token::Empty) => break,
+            Ok(_) => b.i -= 2,  // rewind parsed token
+            Err(e) => return Err(e),
         }
         match parse_stmt(b, state) {
-            Ok(ns) => state = ns,
+            Ok(ns) => { state = ns; continue },
             Err(e) => return Err(e)
         }
     }
@@ -384,7 +350,7 @@ fn parse_metamath(filename: &str) -> Result<(), String> {
         Ok(ns) => state = ns,
         Err(e) => return Err(e)
     }
-    // println!("Constants: {:?}", state.program.constants.keys())
+    // println!("Constants: {:?}", state.program.constants.keys());
     println!("{} constants", state.program.constants.len());
     println!("{} variables", state.program.variables.len());
     println!("{} labels", state.program.labels.len());
