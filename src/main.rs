@@ -126,7 +126,7 @@ enum Token {
     StartProvable,
     StartProof,
     EndStatement,
-    Other,
+    OtherNotRead,
     Empty
 }
 
@@ -159,7 +159,7 @@ fn parse_token(b: &mut ParseBuffer, allow_empty: bool) -> Result<Token, String> 
                 _ => return Err(format!("Unexpected token ${}", c))
             }
         }
-        return Ok(Token::Other)
+        return Ok(Token::OtherNotRead)
     }
 }
 
@@ -231,7 +231,7 @@ fn register_variable(variable: String, mut state: ParserState) -> Result<ParserS
     Ok(state)
 }
 
-fn parse_label(b: &mut ParseBuffer, mut state: ParserState) -> Result<(ParserState, Label), String> {
+fn parse_label(b: &mut ParseBuffer) -> Result<String, String> {
     let start = b.i;
     loop {
         require_another_byte!(b);
@@ -243,6 +243,10 @@ fn parse_label(b: &mut ParseBuffer, mut state: ParserState) -> Result<(ParserSta
         b.i += 1;
     }
     let label = String::from_utf8(b.bytes[start .. b.i].to_vec()).expect("Cannot convert to string");
+    Ok(label)
+}
+
+fn register_label(label: String, mut state: ParserState) -> Result<(ParserState, Label), String> {
     if state.program.labels.contains_key(&label) {
         return Err(format!("Label {} was already defined before", label));
     }
@@ -279,13 +283,11 @@ fn parse_const_var_stmt(b: &mut ParseBuffer, register_symbol: fn(String, ParserS
         skip_blanks(b);
         match read_next_token(b) {
             Ok(Token::EndStatement) => break,
-            Ok(Token::Other) => {
-                match parse_symbol(b) {
-                    Ok(symbol) => {
-                        match register_symbol(symbol, state) {
-                            Ok(ns) => { state = ns; continue },
-                            Err(e) => return Err(e) } },
-                    Err(e) => return Err(e) } },
+            Ok(Token::OtherNotRead) => match parse_symbol(b) {
+                Ok(symbol) => match register_symbol(symbol, state) {
+                    Ok(ns) => { state = ns; continue },
+                    Err(e) => return Err(e) },
+                Err(e) => return Err(e) },
             Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
             Err(e) => return Err(e)
         }
@@ -318,25 +320,17 @@ fn get_variable(variable: &String, state: &ParserState) -> Option<Variable> {
     Some(v)
 }
 
-fn parse_floating_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserState) -> Result<ParserState, String> {
-    let typ: Constant;
-    let var: Variable;
+fn parse_floating(b: &mut ParseBuffer) -> Result<(String, String), String> {
+    let typecode: String;
+    let variable: String;
     skip_blanks(b);
     match parse_symbol(b) {
-        Ok(typecode) => {
-            match get_constant(&typecode, &state.program) {
-                Some(t) => typ = t,
-                None => return Err(format!("Type {} not found in constants", typecode))
-            } },
+        Ok(t) => typecode = t,
         Err(e) => return Err(e)
     }
     skip_blanks(b);
     match parse_symbol(b) {
-        Ok(variable) => {
-            match get_variable(&variable, &state) {
-                Some(v) => var = v,
-                None => return Err(format!("Variable {} not defined", variable))
-            } },
+        Ok(v) => variable = v,
         Err(e) => return Err(e)
     }
     skip_blanks(b);
@@ -345,16 +339,105 @@ fn parse_floating_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserState
         Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
         Err(e) => return Err(e)
     }
+    Ok((typecode, variable))
+}
+
+fn register_floating(label: Label, typecode: String, variable: String, mut state: ParserState) -> Result<ParserState, String> {
+    let typ: Constant;
+    let var: Variable;
+    match get_constant(&typecode, &state.program) {
+        Some(t) => typ = t,
+        None => return Err(format!("Type {} not found in constants", typecode))
+    }
+    match get_variable(&variable, &state) {
+        Some(v) => var = v,
+        None => return Err(format!("Variable {} not defined", variable))
+    }
     if state.scope.vartypes.contains_key(&var) {
         return Err(format!("Variable {} already has a type", var))
     }
     if state.program.vartypes.contains_key(&var) &&
-        state.program.vartypes[&var] != typ {
-            return Err(format!("Variable {} was previously assigned a different type", var))
-        }
+       state.program.vartypes[&var] != typ {
+        return Err(format!("Variable {} was previously assigned a different type", var))
+    }
     state.program.vartypes.insert(var, typ);
     state.scope.vartypes.insert(var, typ);
     state.scope.floatings.insert(label, Floating { typ: typ, var: var });
+    Ok(state)
+}
+
+fn parse_floating_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserState) -> Result<ParserState, String> {
+    match parse_floating(b) {
+        Ok((typecode, variable)) => match register_floating(label, typecode, variable, state) {
+            Ok(ns) => state = ns,
+            Err(e) => return Err(e)
+        },
+        Err(e) => return Err(e)
+    }
+    state.program.n_stmt += 1;
+    Ok(state)
+}
+
+fn parse_typed_symbols(b: &mut ParseBuffer) -> Result<(String, Vec<String>), String> {
+    let typecode: String;
+    let mut symbols = vec![];
+    skip_blanks(b);
+    match parse_symbol(b) {
+        Ok(t) => typecode = t,
+        Err(e) => return Err(e)
+    }
+    loop {
+        skip_blanks(b);
+        match read_next_token(b) {
+            Ok(Token::EndStatement) => break,
+            Ok(Token::OtherNotRead) => {
+                match parse_symbol(b) {
+                    Ok(s) => symbols.push(s),
+                    Err(e) => return Err(e)
+                }
+            },
+            Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
+            Err(e) => return Err(e)
+        }
+    }
+    Ok((typecode, symbols))
+}
+
+fn register_essential(label: Label, typecode: String, symbols: Vec<String>, mut state: ParserState) -> Result<ParserState, String> {
+    let typ: Constant;
+    match get_constant(&typecode, &state.program) {
+        Some(t) => typ = t,
+        None => return Err(format!("Type {} not found in constants", typecode))
+    }
+    let mut syms = vec![];
+    for sym in symbols {
+        match get_constant(&sym, &state.program) {
+            Some(c) => syms.push(c),
+            None => {
+                match get_variable(&sym, &state) {
+                    Some(v) => {
+                        if !state.scope.vartypes.contains_key(&v) {
+                            return Err(format!("Variable {} must be assigned a type", sym))
+                        }
+                        syms.push(v)
+                    },
+                    None => return Err(format!("Variable or constant {} not defined", sym))
+                }
+            }
+        }
+    }
+    state.scope.essentials.insert(label, TypedSymbols { typ: typ, syms: syms });
+    Ok(state)
+}
+
+fn parse_essential_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserState) -> Result<ParserState, String> {
+    match parse_typed_symbols(b) {
+        Ok((typecode, symbols)) => match register_essential(label, typecode, symbols, state) {
+            Ok(ns) => state = ns,
+            Err(e) => return Err(e)
+        },
+        Err(e) => return Err(e)
+    }
     state.program.n_stmt += 1;
     Ok(state)
 }
@@ -377,20 +460,22 @@ fn parse_labeled_stmt(b: &mut ParseBuffer, mut state: ParserState) -> Result<Par
 
     skip_blanks(b);
     require_another_byte!(b);
-    match parse_label(b, state) {
-        Ok((ns, l)) => { state = ns; label = l },
+    match parse_label(b) {
+        Ok(l) => match register_label(l, state) {
+            Ok((ns, lab)) => { state = ns; label = lab },
+            Err(e) => return Err(e)
+        },
         Err(e) => return Err(e)
     }
-    // println!("{} ({})", label, b.i);
 
     loop {
         skip_blanks(b);
         match read_next_token(b) {
             Ok(Token::StartFloating) => return parse_floating_stmt(b, label, state),
-            Ok(Token::StartEssential) => return parse_xxx_stmt(b, state),
+            Ok(Token::StartEssential) => return parse_essential_stmt(b, label, state),
             Ok(Token::StartAxiom) => return parse_xxx_stmt(b, state),
             Ok(Token::StartProvable) => return parse_xxx_stmt(b, state),
-            Ok(Token::Other) => return Err(format!("Unexpected token {}", b.bytes[b.i] as char)),
+            Ok(Token::OtherNotRead) => return Err(format!("Unexpected token {}", b.bytes[b.i] as char)),
             Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
             Err(e) => return Err(e)
         }
@@ -408,7 +493,7 @@ fn parse_stmt(b: &mut ParseBuffer, state: ParserState) -> Result<ParserState, St
             } },
         Ok(Token::StartVariable) => return parse_const_var_stmt(b, register_variable, state),
         Ok(Token::StartDisjoint) => return parse_xxx_stmt(b, state),
-        Ok(Token::Other) => {},
+        Ok(Token::OtherNotRead) => {},
         Ok(_) => b.i -= 2,  // rewind parsed token
         Err(e) => return Err(e),
     }
@@ -420,7 +505,7 @@ fn parse_block(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserStat
         skip_blanks(b);
         match read_next_token(b) {
             Ok(Token::EndBlock) => break,
-            Ok(Token::Other) => {},
+            Ok(Token::OtherNotRead) => {},
             Ok(_) => b.i -= 2,  // rewind parsed token
             Err(e) => return Err(e),
         }
@@ -440,7 +525,7 @@ fn parse_top_level(b: &mut ParseBuffer, mut state: ParserState) -> Result<Parser
             Ok(Token::StartConstant) => match parse_const_var_stmt(b, register_constant, state) {
                 Ok(ns) => { state = ns; continue },
                 Err(e) => return Err(e) },
-            Ok(Token::Other) => {},
+            Ok(Token::OtherNotRead) => {},
             Ok(Token::Empty) => break,
             Ok(_) => b.i -= 2,  // rewind parsed token
             Err(e) => return Err(e),
