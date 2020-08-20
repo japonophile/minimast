@@ -16,9 +16,13 @@ pub struct Program {
 }
 
 pub struct ParserState {
-    pub i: usize,
     pub program: Program,
     pub scope: Scope
+}
+
+pub struct ParseBuffer<'a> {
+    pub bytes: &'a [u8],
+    pub i: usize
 }
 
 impl Clone for Scope {
@@ -30,59 +34,51 @@ impl Clone for Scope {
 }
 
 macro_rules! check_bytes_left {
-    ($i:ident, $b:ident) => {
-        if *$i >= $b.len() {
+    ($b:ident) => {
+        if $b.i >= $b.bytes.len() {
             return Err("Unexpected EOS".to_string())
         }
     }
 }
 
 macro_rules! skip_comment {
-    ($i:ident, $b:ident) => {
-        if $b[*$i] == '(' as u8 {
-            *$i += 1;
-            match parse_comment($b, *$i) {
-                Ok(ni) => *$i = ni,
+    ($b:ident) => {
+        if $b.bytes[$b.i] as char == '(' {
+            $b.i += 1;
+            match parse_comment($b) {
+                Ok(()) => continue,
                 Err(e) => return Err(e)
             }
-            continue
         }
     }
 }
 
-fn skip_blanks(bytes: &[u8], start: usize) -> usize {
-    let mut i = start;
+fn skip_blanks(b: &mut ParseBuffer) {
     loop {
-        if i >= bytes.len() {
+        if b.i >= b.bytes.len() {
             break
         }
-        if bytes[i] == ' ' as u8 ||
-           bytes[i] == '\t' as u8 ||
-           bytes[i] == '\r' as u8 ||
-           bytes[i] == '\n' as u8 {
-            i += 1;
-            continue
+        match b.bytes[b.i] as char {
+            ' ' | '\t' | '\r' | '\n' => b.i += 1,
+            _ => break
         }
-        break
     }
-    i
 }
 
 fn is_math_symbol(byte: u8) -> bool {
     return byte >= 0x21 && byte <= 0x7e && byte != '$' as u8
 }
 
-fn parse_constant(bytes: &[u8], mut state: ParserState) -> Result<ParserState, String> {
-    let i = &mut state.i;
-    let start = *i;
+fn parse_constant(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
+    let start = b.i;
     loop {
-        check_bytes_left!(i, bytes);
-        if !is_math_symbol(bytes[*i]) {
+        check_bytes_left!(b);
+        if !is_math_symbol(b.bytes[b.i]) {
             break
         }
-        *i += 1;
+        b.i += 1;
     }
-    let constant = String::from_utf8(bytes[start .. *i].to_vec()).expect("Cannot convert to string");
+    let constant = String::from_utf8(b.bytes[start .. b.i].to_vec()).expect("Cannot convert to string");
     if state.program.constants.contains_key(&constant) {
         return Err(format!("Constant {} was already defined before", constant));
     }
@@ -96,17 +92,16 @@ fn parse_constant(bytes: &[u8], mut state: ParserState) -> Result<ParserState, S
     Ok(state)
 }
 
-fn parse_variable(bytes: &[u8], mut state: ParserState) -> Result<ParserState, String> {
-    let i = &mut state.i;
-    let start = *i;
+fn parse_variable(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
+    let start = b.i;
     loop {
-        check_bytes_left!(i, bytes);
-        if !is_math_symbol(bytes[*i]) {
+        check_bytes_left!(b);
+        if !is_math_symbol(b.bytes[b.i]) {
             break
         }
-        *i += 1;
+        b.i += 1;
     }
-    let variable = String::from_utf8(bytes[start .. *i].to_vec()).expect("Cannot convert to string");
+    let variable = String::from_utf8(b.bytes[start .. b.i].to_vec()).expect("Cannot convert to string");
     if state.program.constants.contains_key(&variable) {
         return Err(format!("Variable {} matches an existing constant", variable));
     }
@@ -128,19 +123,18 @@ fn parse_variable(bytes: &[u8], mut state: ParserState) -> Result<ParserState, S
     Ok(state)
 }
 
-fn parse_label(bytes: &[u8], mut state: ParserState) -> Result<(ParserState, u32), String> {
-    let i = &mut state.i;
-    let start = *i;
+fn parse_label(b: &mut ParseBuffer, mut state: ParserState) -> Result<(ParserState, u32), String> {
+    let start = b.i;
     loop {
-        check_bytes_left!(i, bytes);
-        let c = char::from(bytes[*i]);
+        check_bytes_left!(b);
+        let c = char::from(b.bytes[b.i]);
         if !c.is_ascii_alphanumeric() &&
            c != '.' && c != '-' && c != '_' {
             break
         }
-        *i += 1;
+        b.i += 1;
     }
-    let label = String::from_utf8(bytes[start .. *i].to_vec()).expect("Cannot convert to string");
+    let label = String::from_utf8(b.bytes[start .. b.i].to_vec()).expect("Cannot convert to string");
     if state.program.labels.contains_key(&label) {
         return Err(format!("Label {} was already defined before", label));
     }
@@ -155,47 +149,45 @@ fn parse_label(bytes: &[u8], mut state: ParserState) -> Result<(ParserState, u32
     Ok((state, l))
 }
 
-fn parse_comment(bytes: &[u8], mut start: usize) -> Result<usize, String> {
-    let i = &mut start;
+fn parse_comment(b: &mut ParseBuffer) -> Result<(), String> {
     loop {
-        check_bytes_left!(i, bytes);
-        if bytes[*i] == '$' as u8 {
-            *i += 1;
-            check_bytes_left!(i, bytes);
-            if bytes[*i] == '(' as u8 {
+        check_bytes_left!(b);
+        if b.bytes[b.i] as char == '$' {
+            b.i += 1;
+            check_bytes_left!(b);
+            if b.bytes[b.i] as char == '(' {
                 return Err("Comments may not be nested".to_string())
             }
-            if bytes[*i] == ')' as u8 {
-                *i += 1;
+            if b.bytes[b.i] as char == ')' {
+                b.i += 1;
                 break
             }
         }
-        *i += 1
+        b.i += 1
     }
-    Ok(*i)
+    Ok(())
 }
 
-fn parse_const_var_stmt(bytes: &[u8], parse_element: fn(&[u8], ParserState) -> Result<ParserState, String>, mut state: ParserState) -> Result<ParserState, String> {
+fn parse_const_var_stmt(b: &mut ParseBuffer, parse_element: fn(&mut ParseBuffer, ParserState) -> Result<ParserState, String>, mut state: ParserState) -> Result<ParserState, String> {
     state.program.n_stmt += 1;
-    let mut i = &mut state.i;
     loop {
-        *i = skip_blanks(bytes, *i);
-        check_bytes_left!(i, bytes);
-        if bytes[*i] == '$' as u8 {
-            *i += 1;
-            check_bytes_left!(i, bytes);
-            skip_comment!(i, bytes);
-            if bytes[*i] == '.' as u8 {
-                *i += 1;
+        skip_blanks(b);
+        check_bytes_left!(b);
+        if b.bytes[b.i] as char == '$' {
+            b.i += 1;
+            check_bytes_left!(b);
+            skip_comment!(b);
+            if b.bytes[b.i] as char == '.' {
+                b.i += 1;
                 break
             }
             else {
-                return Err(format!("Unexpected token ${}", bytes[*i] as char))
+                return Err(format!("Unexpected token ${}", b.bytes[b.i] as char))
             }
         }
         else {
-            match parse_element(bytes, state) {
-                Ok(ns) => { state = ns; i = &mut state.i },
+            match parse_element(b, state) {
+                Ok(ns) => state = ns,
                 Err(e) => return Err(e)
             }
         }
@@ -203,127 +195,123 @@ fn parse_const_var_stmt(bytes: &[u8], parse_element: fn(&[u8], ParserState) -> R
     Ok(state)
 }
 
-fn parse_xxx_stmt(bytes: &[u8], mut state: ParserState) -> Result<ParserState, String> {
-    let i = &mut state.i;
+fn parse_xxx_stmt(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
     loop {
-        *i = skip_blanks(bytes, *i);
-        check_bytes_left!(i, bytes);
-        if bytes[*i] == '$' as u8 {
-            *i += 1;
-            check_bytes_left!(i, bytes);
-            if bytes[*i] == '.' as u8 {
-                *i += 1;
+        skip_blanks(b);
+        check_bytes_left!(b);
+        if b.bytes[b.i] as char == '$' {
+            b.i += 1;
+            check_bytes_left!(b);
+            if b.bytes[b.i] as char == '.' {
+                b.i += 1;
                 break
             }
         }
-        *i += 1;
+        b.i += 1;
     }
     state.program.n_stmt += 1;
     Ok(state)
 }
 
-fn parse_labeled_stmt(bytes: &[u8], mut state: ParserState) -> Result<ParserState, String> {
-    let mut i = &mut state.i;
+fn parse_labeled_stmt(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
     let label: u32;
 
-    *i = skip_blanks(bytes, *i);
-    check_bytes_left!(i, bytes);
-    match parse_label(bytes, state) {
-        Ok((ns, l)) => { state = ns; i = &mut state.i; label = l },
+    skip_blanks(b);
+    check_bytes_left!(b);
+    match parse_label(b, state) {
+        Ok((ns, l)) => { state = ns; label = l },
         Err(e) => return Err(e)
     }
     // println!("{}", label);
 
     loop {
-        *i = skip_blanks(bytes, *i);
-        check_bytes_left!(i, bytes);
-        if bytes[*i] == '$' as u8 {
-            *i += 1;
-            check_bytes_left!(i, bytes);
-            skip_comment!(i, bytes);
-            if bytes[*i] == 'f' as u8 {
-                *i += 1;
+        skip_blanks(b);
+        check_bytes_left!(b);
+        if b.bytes[b.i] as char == '$' {
+            b.i += 1;
+            check_bytes_left!(b);
+            skip_comment!(b);
+            if b.bytes[b.i] as char == 'f' {
+                b.i += 1;
                 // parse floating statement
-                return parse_xxx_stmt(bytes, state);
+                return parse_xxx_stmt(b, state);
             }
-            else if bytes[*i] == 'e' as u8 {
-                *i += 1;
+            else if b.bytes[b.i] as char == 'e' {
+                b.i += 1;
                 // parse essential statement
-                return parse_xxx_stmt(bytes, state);
+                return parse_xxx_stmt(b, state);
             }
-            else if bytes[*i] == 'a' as u8 {
-                *i += 1;
+            else if b.bytes[b.i] as char == 'a' {
+                b.i += 1;
                 // parse axiom statement
-                return parse_xxx_stmt(bytes, state);
+                return parse_xxx_stmt(b, state);
             }
-            else if bytes[*i] == 'p' as u8 {
-                *i += 1;
+            else if b.bytes[b.i] as char == 'p' {
+                b.i += 1;
                 // parse provable statement
-                return parse_xxx_stmt(bytes, state);
+                return parse_xxx_stmt(b, state);
             }
             else {
-                return Err(format!("Unexpected token ${}", bytes[*i] as char))
+                return Err(format!("Unexpected token ${}", b.bytes[b.i] as char))
             }
         }
         else {
-            return Err(format!("Unexpected token {}", bytes[*i] as char))
+            return Err(format!("Unexpected token {}", b.bytes[b.i] as char))
         }
     }
 }
 
-fn parse_stmt(bytes: &[u8], mut state: ParserState) -> Result<ParserState, String> {
-    let i = &mut state.i;
+fn parse_stmt(b: &mut ParseBuffer, state: ParserState) -> Result<ParserState, String> {
     loop {
-        *i = skip_blanks(bytes, *i);
-        check_bytes_left!(i, bytes);
-        if bytes[*i] == '$' as u8 {
-            *i += 1;
-            check_bytes_left!(i, bytes);
-            skip_comment!(i, bytes);
-            if bytes[*i] == '{' as u8 {
-                *i += 1;
+        skip_blanks(b);
+        check_bytes_left!(b);
+        if b.bytes[b.i] as char == '$' {
+            b.i += 1;
+            check_bytes_left!(b);
+            skip_comment!(b);
+            if b.bytes[b.i] as char == '{' {
+                b.i += 1;
                 let original_scope = state.scope.clone();
-                match parse_block(bytes, state) {
+                match parse_block(b, state) {
                     Ok(mut ns) => { ns.scope = original_scope; return Ok(ns) },
                     Err(e) => return Err(e)
                 }
             }
-            if bytes[*i] == 'v' as u8 {
-                *i += 1;
-                return parse_const_var_stmt(bytes, parse_variable, state);
+            if b.bytes[b.i] as char == 'v' {
+                b.i += 1;
+                return parse_const_var_stmt(b, parse_variable, state);
             }
-            else if bytes[*i] == 'd' as u8 {
-                *i += 1;
+            else if b.bytes[b.i] as char == 'd' {
+                b.i += 1;
                 // parse disjoint statement
-                return parse_xxx_stmt(bytes, state);
+                return parse_xxx_stmt(b, state);
             }
             else {
-                *i -= 1;
+                b.i -= 1;
             }
         }
-        return parse_labeled_stmt(bytes, state);
+        return parse_labeled_stmt(b, state);
     }
 }
 
-fn parse_block(bytes: &[u8], mut state: ParserState) -> Result<ParserState, String> {
-    let mut i = &mut state.i;
+fn parse_block(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
     loop {
-        *i = skip_blanks(bytes, *i);
-        check_bytes_left!(i, bytes);
-        if bytes[*i] == '$' as u8 {
-            *i += 1;
-            check_bytes_left!(i, bytes);
-            skip_comment!(i, bytes);
-            if bytes[*i] == '}' as u8 {
-                *i += 1;
+        skip_blanks(b);
+        check_bytes_left!(b);
+        if b.bytes[b.i] as char == '$' {
+            b.i += 1;
+            check_bytes_left!(b);
+            skip_comment!(b);
+            if b.bytes[b.i] as char == '}' {
+                b.i += 1;
                 break
             }
             else {
-                *i -= 1;
+                b.i -= 1;
             }
         }
-        match parse_stmt(bytes, state) {
-            Ok(ns) => { state = ns; i = &mut state.i },
+        match parse_stmt(b, state) {
+            Ok(ns) => state = ns,
             Err(e) => return Err(e)
         }
     }
@@ -331,44 +319,43 @@ fn parse_block(bytes: &[u8], mut state: ParserState) -> Result<ParserState, Stri
     Ok(state)
 }
 
-fn parse_top_level(bytes: &[u8], mut state: ParserState) -> Result<ParserState, String> {
-    let mut i = &mut state.i;
+fn parse_top_level(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
     loop {
-        *i = skip_blanks(bytes, *i);
-        if *i >= bytes.len() {
+        skip_blanks(b);
+        if b.i >= b.bytes.len() {
             break
         }
-        if bytes[*i] == '$' as u8 {
-            *i += 1;
-            check_bytes_left!(i, bytes);
-            skip_comment!(i, bytes);
-            if bytes[*i] == 'c' as u8 {
-                *i += 1;
-                match parse_const_var_stmt(bytes, parse_constant, state) {
-                    Ok(ns) => { state = ns; i = &mut state.i },
+        if b.bytes[b.i] as char == '$' {
+            b.i += 1;
+            check_bytes_left!(b);
+            skip_comment!(b);
+            if b.bytes[b.i] as char == 'c' {
+                b.i += 1;
+                match parse_const_var_stmt(b, parse_constant, state) {
+                    Ok(ns) => state = ns,
                     Err(e) => return Err(e)
                 }
                 continue
             }
-            else if bytes[*i] == '{' as u8 {
-                *i += 1;
+            else if b.bytes[b.i] as char == '{' {
+                b.i += 1;
                 let original_scope = state.scope.clone();
-                match parse_block(bytes, state) {
-                    Ok(ns) => { state = ns; state.scope = original_scope; i = &mut state.i },
+                match parse_block(b, state) {
+                    Ok(ns) => { state = ns; state.scope = original_scope },
                     Err(e) => return Err(e)
                 }
                 continue
             }
             else {
-                *i -= 1;
+                b.i -= 1;
             }
         }
-        match parse_stmt(bytes, state) {
-            Ok(ns) => { state = ns; i = &mut state.i },
+        match parse_stmt(b, state) {
+            Ok(ns) => state = ns,
             Err(e) => return Err(e)
         }
     }
-    println!("{} bytes were read into the source buffer.", bytes.len());
+    println!("{} bytes were read into the source buffer.", b.bytes.len());
     println!("The source has {} statements;", state.program.n_stmt);
     Ok(state)
 }
@@ -376,7 +363,6 @@ fn parse_top_level(bytes: &[u8], mut state: ParserState) -> Result<ParserState, 
 fn parse_metamath(filename: &str) -> Result<(), String> {
     let now = Instant::now();
     let mut state = ParserState {
-        i: 0,
         program: Program {
             n_stmt: 0,
             constants: HashMap::new(),
@@ -389,18 +375,19 @@ fn parse_metamath(filename: &str) -> Result<(), String> {
     };
     print!("Reading source file \"{}\"... ", filename);
     let program_text = fs::read_to_string(filename).expect("Could not read file");
-    let bytes = program_text.as_bytes();
-    println!("{} bytes", bytes.len());
-    match parse_top_level(bytes, state) {
-        Ok(ns) => {
-            state = ns;
-            // println!("Constants: {:?}", state.program.constants.keys())
-            println!("{} constants", state.program.constants.len());
-            println!("{} variables", state.program.variables.len());
-            println!("{} labels", state.program.labels.len())
-        },
-        Err(e) => println!("Error: {}", e)
+    let mut b = ParseBuffer {
+        bytes: program_text.as_bytes(),
+        i: 0
+    };
+    println!("{} bytes", b.bytes.len());
+    match parse_top_level(&mut b, state) {
+        Ok(ns) => state = ns,
+        Err(e) => return Err(e)
     }
+    // println!("Constants: {:?}", state.program.constants.keys())
+    println!("{} constants", state.program.constants.len());
+    println!("{} variables", state.program.variables.len());
+    println!("{} labels", state.program.labels.len());
     println!("Program parsed in {} msec", now.elapsed().subsec_millis());
     Ok(())
 }
