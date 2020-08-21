@@ -37,20 +37,15 @@ pub enum ProofStep {
     Unknown()
 }
 
-pub enum Proof {
-    Uncompressed {
-        labels: Vec<ProofStep>
-    },
-    Compressed {
-        labels: Vec<Label>,
-        chars: String
-    }
-}
+type Proof = Vec<ProofStep>;
 
 pub struct Assertion {
     pub ax: TypedSymbols,
     pub proof: Option<Proof>,
-    pub scope: Scope
+    pub scope: Scope,
+    pub mvars: HashSet<Variable>,
+    pub mhyps: Vec<Label>,
+    pub mdisj: HashSet<(Variable, Variable)>,
 }
 
 pub struct Program {
@@ -512,47 +507,114 @@ fn parse_disjoint_stmt(b: &mut ParseBuffer, mut state: ParserState) -> Result<Pa
     Ok(state)
 }
 
-fn register_axiom(label: Label, typecode: String, symbols: Vec<String>, mut state: ParserState) -> Result<ParserState, String> {
-    match encode_typed_symbols(typecode, symbols, &state) {
+fn mandatory_variables(syms: &Vec<Symbol>, scope: &Scope) -> HashSet<Variable> {
+    let mut mvars = HashSet::new();
+    for s in syms.iter() {
+        if scope.variables.contains(&s) {
+            mvars.insert(*s);
+        }
+    }
+    for e in scope.essentials.values() {
+        for s in e.syms.iter() {
+            if scope.variables.contains(&s) {
+                mvars.insert(*s);
+            }
+        }
+    }
+    mvars
+}
+
+pub fn mandatory_hypotheses(mvars: &HashSet<Variable>, scope: &Scope) -> Vec<Label> {
+    let mut mhyps = HashSet::new();
+    for (label, f) in scope.floatings.iter() {
+        if mvars.contains(&f.var) {
+            mhyps.insert(*label);
+        }
+    }
+    for label in scope.essentials.keys() {
+        mhyps.insert(*label);
+    }
+    let mut sorted_mhyps: Vec<Label> = mhyps.iter().cloned().collect();
+    sorted_mhyps.sort();
+    sorted_mhyps
+}
+
+pub fn mandatory_disjoints(mvars: &HashSet<Variable>, scope: &Scope) -> HashSet<(Variable, Variable)> {
+    let mut mdisjs = HashSet::new();
+    for (v1, v2) in scope.disjoints.iter() {
+        if mvars.contains(v1) && mvars.contains(v2) {
+            mdisjs.insert((*v1, *v2));
+        }
+    }
+    mdisjs
+}
+
+fn create_assertion(typecode: String, symbols: Vec<String>, state: &ParserState) -> Result<Assertion, String> {
+    match encode_typed_symbols(typecode, symbols, state) {
         Ok((typ, syms)) => {
-            state.program.axioms.insert(label, Assertion {
+            let mvars = mandatory_variables(&syms, &state.scope);
+            let mhyps = mandatory_hypotheses(&mvars, &state.scope);
+            let mdisj = mandatory_disjoints(&mvars, &state.scope);
+            return Ok(Assertion {
                 ax: TypedSymbols { typ: typ, syms: syms },
                 proof: None,
-                scope: state.scope.clone()
+                scope: state.scope.clone(),
+                mvars: mvars,
+                mhyps: mhyps,
+                mdisj: mdisj,
             });
         },
         Err(e) => return Err(e)
     }
-    Ok(state)
 }
 
 fn parse_axiom_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserState) -> Result<ParserState, String> {
     match parse_typed_symbols_until(b, Token::EndStatement) {
-        Ok((typecode, symbols)) => match register_axiom(label, typecode, symbols, state) {
-            Ok(ns) => state = ns,
-            Err(e) => return Err(e)
-        },
+        Ok((typecode, symbols)) => match create_assertion(typecode, symbols, &state) {
+            Ok(axiom) => { state.program.axioms.insert(label, axiom); },
+            Err(e) => return Err(e) },
         Err(e) => return Err(e)
     }
     state.program.n_stmt += 1;
     Ok(state)
 }
 
-fn register_provable(label: Label, typecode: String, symbols: Vec<String>, proof: Proof, mut state: ParserState) -> Result<ParserState, String> {
-    match encode_typed_symbols(typecode, symbols, &state) {
-        Ok((typ, syms)) => {
-            state.program.provables.insert(label, Assertion {
-                ax: TypedSymbols { typ: typ, syms: syms },
-                proof: Some(proof),
-                scope: state.scope.clone()
-            });
-        },
-        Err(e) => return Err(e)
+pub fn decode_proof_chars(chars: &String, labels: &Vec<Label>, mhyps: &Vec<Label>) -> Proof {
+    let m = mhyps.len();
+    let n = labels.len();
+    let mut proof = vec![];
+    let mut acc = 0;
+    for c in chars.chars() {
+        if c == '?' {
+            proof.push(ProofStep::Unknown());
+            continue
+        }
+        if c == 'Z' {
+            proof.push(ProofStep::Save());
+            continue
+        }
+        if c > 'T' {
+            acc = 5 * acc + 20 * ((c as u32) - 84);
+            continue
+        }
+        let i = (acc + ((c as u32) - 64)) as usize;
+        if i <= m {
+            proof.push(ProofStep::Label(mhyps[i - 1]));
+            acc = 0;
+            continue
+        }
+        if i <= m + n {
+            proof.push(ProofStep::Label(labels[i - m - 1]));
+            acc = 0;
+            continue
+        }
+        proof.push(ProofStep::Load(i - m - n - 1));
+        acc = 0;
     }
-    Ok(state)
+    proof
 }
 
-fn parse_compressed_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<Proof, String> {
+fn parse_compressed_proof(b: &mut ParseBuffer, provable: &Assertion, state: &ParserState) -> Result<Proof, String> {
     let mut labels = vec![];
     let mut chars = "".to_string();
     match parse_symbol(b) {
@@ -593,11 +655,11 @@ fn parse_compressed_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<Pr
         Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
         Err(e) => return Err(e)
     }
-    Ok(Proof::Compressed { labels: labels, chars: chars })
+    Ok(decode_proof_chars(&chars, &labels, &provable.mhyps))
 }
 
 fn parse_uncompressed_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<Proof, String> {
-    let mut labels = vec![];
+    let mut proof = vec![];
     loop {
         skip_blanks(b);
         match read_next_token(b) {
@@ -606,13 +668,13 @@ fn parse_uncompressed_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<
                 match parse_symbol(b) {
                     Ok(s) => {
                         if s == "?" {
-                            labels.push(ProofStep::Unknown());
+                            proof.push(ProofStep::Unknown());
                             continue
                         }
                         if !state.program.labels.contains_key(&s) {
                             return Err(format!("Label {} not defined.", s))
                         }
-                        labels.push(ProofStep::Label(state.program.labels[&s]));
+                        proof.push(ProofStep::Label(state.program.labels[&s]));
                         continue
                     },
                     Err(e) => return Err(e) } },
@@ -620,17 +682,17 @@ fn parse_uncompressed_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<
             Err(e) => return Err(e)
         }
     }
-    Ok(Proof::Uncompressed { labels: labels })
+    Ok(proof)
 }
 
-fn parse_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<Proof, String> {
+fn parse_proof(b: &mut ParseBuffer, provable: &Assertion, state: &ParserState) -> Result<Proof, String> {
     skip_blanks(b);
     let start = b.i;
     match parse_symbol(b) {
         Ok(s) => {
             b.i = start;  // rewind
             if s == "(" {
-                return parse_compressed_proof(b, state)
+                return parse_compressed_proof(b, provable, state)
             }
             else {
                 return parse_uncompressed_proof(b, state)
@@ -641,9 +703,11 @@ fn parse_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<Proof, String
 
 fn parse_provable_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserState) -> Result<ParserState, String> {
     match parse_typed_symbols_until(b, Token::StartProof) {
-        Ok((typecode, symbols)) => match parse_proof(b, &state) {
-            Ok(proof) => match register_provable(label, typecode, symbols, proof, state) {
-                Ok(ns) => state = ns,
+        Ok((typecode, symbols)) => match create_assertion(typecode, symbols, &state) {
+            Ok(mut provable) => match parse_proof(b, &provable, &state) {
+                Ok(proof) => {
+                    provable.proof = Some(proof);
+                    state.program.provables.insert(label, provable); },
                 Err(e) => return Err(e) },
             Err(e) => return Err(e) },
         Err(e) => return Err(e)
