@@ -187,10 +187,6 @@ fn parse_symbol(b: &mut ParseBuffer) -> Result<String, String> {
         }
         b.i += 1;
     }
-    if start == b.i {
-        println!("Empty symbol found: {:?}",
-                 String::from_utf8(b.bytes[start .. start + 10].to_vec()).expect("Cannot convert to string"));
-    }
     let symbol = String::from_utf8(b.bytes[start .. b.i].to_vec()).expect("Cannot convert to string");
     Ok(symbol)
 }
@@ -874,7 +870,7 @@ fn apply_substitutions(subst: &Substitutions, syms: &Vec<Symbol>, constants: &Ha
     subst_syms
 }
 
-fn find_substitutions(stack: &Vec<TypedSymbols>, mhyps: &Vec<Label>, scope: &Scope, constants: &HashSet<Constant>) -> Result<HashMap<Variable, Vec<Symbol>>, String> {
+fn find_substitutions(stack: &Vec<TypedSymbols>, mhyps: &Vec<Label>, scope: &Scope, constants: &HashSet<Constant>) -> Result<Substitutions, String> {
     let mut subst = HashMap::new();
     let mut i = stack.len() - mhyps.len();
     for l in mhyps {
@@ -920,7 +916,7 @@ fn are_expressions_disjoint(expr1: &Vec<Symbol>, expr2: &Vec<Symbol>, provable_v
     true
 }
 
-fn is_disjoint_restriction_verified(vpair: (Variable, Variable), mdisj: &HashSet<(Variable, Variable)>, provable_scope: &Scope, subst: &HashMap<Variable, Vec<Symbol>>) -> bool {
+fn is_disjoint_restriction_verified(vpair: (Variable, Variable), mdisj: &HashSet<(Variable, Variable)>, provable_scope: &Scope, subst: &Substitutions) -> bool {
     let (v1, v2) = vpair;
     if mdisj.contains(&vpair) && subst.contains_key(&v1) && subst.contains_key(&v2) {
         let (expr1, expr2) = (subst[&v1].to_vec(), subst[&v2].to_vec());
@@ -929,7 +925,7 @@ fn is_disjoint_restriction_verified(vpair: (Variable, Variable), mdisj: &HashSet
     true
 }
 
-fn are_disjoint_restrictions_verified(axiom: &Assertion, provable_scope: &Scope, subst: &HashMap<Variable, Vec<Symbol>>) -> bool {
+fn are_disjoint_restrictions_verified(axiom: &Assertion, provable_scope: &Scope, subst: &Substitutions) -> bool {
     let mut mvars = axiom.mvars.iter().collect_vec();
     mvars.sort();
     for (v1, v2) in mvars.iter().tuple_combinations() {
