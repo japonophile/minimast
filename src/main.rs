@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
@@ -114,6 +115,7 @@ fn skip_blanks(b: &mut ParseBuffer) {
     }
 }
 
+#[derive(PartialEq)]
 enum Token {
     StartBlock,
     EndBlock,
@@ -278,7 +280,6 @@ fn parse_comment(b: &mut ParseBuffer) -> Result<(), String> {
 }
 
 fn parse_const_var_stmt(b: &mut ParseBuffer, register_symbol: fn(String, ParserState) -> Result<ParserState, String>, mut state: ParserState) -> Result<ParserState, String> {
-    state.program.n_stmt += 1;
     loop {
         skip_blanks(b);
         match read_next_token(b) {
@@ -292,6 +293,7 @@ fn parse_const_var_stmt(b: &mut ParseBuffer, register_symbol: fn(String, ParserS
             Err(e) => return Err(e)
         }
     }
+    state.program.n_stmt += 1;
     Ok(state)
 }
 
@@ -378,32 +380,59 @@ fn parse_floating_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserState
     Ok(state)
 }
 
-fn parse_typed_symbols(b: &mut ParseBuffer) -> Result<(String, Vec<String>), String> {
-    let typecode: String;
+fn parse_symbols_until(b: &mut ParseBuffer, end_token: Token) -> Result<Vec<String>, String> {
     let mut symbols = vec![];
-    skip_blanks(b);
-    match parse_symbol(b) {
-        Ok(t) => typecode = t,
-        Err(e) => return Err(e)
-    }
     loop {
         skip_blanks(b);
         match read_next_token(b) {
-            Ok(Token::EndStatement) => break,
             Ok(Token::OtherNotRead) => {
                 match parse_symbol(b) {
                     Ok(s) => symbols.push(s),
                     Err(e) => return Err(e)
                 }
             },
-            Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
+            Ok(t) => {
+                if t == end_token {
+                    break
+                }
+                else {
+                    return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char))
+                }
+            },
             Err(e) => return Err(e)
         }
+    }
+    Ok(symbols)
+}
+
+fn parse_symbols(b: &mut ParseBuffer) -> Result<Vec<String>, String> {
+    return parse_symbols_until(b, Token::EndStatement);
+}
+
+fn parse_typed_symbols_until(b: &mut ParseBuffer, end_token: Token) -> Result<(String, Vec<String>), String> {
+    let typecode: String;
+    let symbols: Vec<String>;
+    skip_blanks(b);
+    match read_next_token(b) {
+        Ok(Token::OtherNotRead) => {
+            match parse_symbol(b) {
+                Ok(s) => typecode = s,
+                Err(e) => return Err(e) } },
+        Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
+        Err(e) => return Err(e)
+    }
+    match parse_symbols_until(b, end_token) {
+        Ok(ss) => symbols = ss,
+        Err(e) => return Err(e)
     }
     Ok((typecode, symbols))
 }
 
-fn register_essential(label: Label, typecode: String, symbols: Vec<String>, mut state: ParserState) -> Result<ParserState, String> {
+fn parse_typed_symbols(b: &mut ParseBuffer) -> Result<(String, Vec<String>), String> {
+    return parse_typed_symbols_until(b, Token::EndStatement);
+}
+
+fn encode_typed_symbols(typecode: String, symbols: Vec<String>, state: &ParserState) -> Result<(Constant, Vec<Symbol>), String> {
     let typ: Constant;
     match get_constant(&typecode, &state.program) {
         Some(t) => typ = t,
@@ -426,7 +455,16 @@ fn register_essential(label: Label, typecode: String, symbols: Vec<String>, mut 
             }
         }
     }
-    state.scope.essentials.insert(label, TypedSymbols { typ: typ, syms: syms });
+    Ok((typ, syms))
+}
+
+fn register_essential(label: Label, typecode: String, symbols: Vec<String>, mut state: ParserState) -> Result<ParserState, String> {
+    match encode_typed_symbols(typecode, symbols, &state) {
+        Ok((typ, syms)) => {
+            state.scope.essentials.insert(label, TypedSymbols { typ: typ, syms: syms });
+        },
+        Err(e) => return Err(e)
+    }
     Ok(state)
 }
 
@@ -442,14 +480,173 @@ fn parse_essential_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserStat
     Ok(state)
 }
 
-fn parse_xxx_stmt(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
+fn register_disjoint(variables: Vec<String>, mut state: ParserState) -> Result<ParserState, String> {
+    let mut vars = vec![];
+    for var in variables {
+        match get_variable(&var, &state) {
+            Some(v) => {
+                if vars.contains(&v) {
+                    return Err(format!("Variable {} appears more than once in a disjoint statement", var));
+                }
+                vars.push(v)
+            },
+            None => return Err(format!("Variable {} not defined", var))
+        }
+    }
+    vars.sort();
+    for (v1, v2) in vars.iter().tuple_combinations() {
+        state.scope.disjoints.insert((*v1, *v2));
+    }
+    Ok(state)
+}
+
+fn parse_disjoint_stmt(b: &mut ParseBuffer, mut state: ParserState) -> Result<ParserState, String> {
+    match parse_symbols(b) {
+        Ok(variables) => match register_disjoint(variables, state) {
+            Ok(ns) => state = ns,
+            Err(e) => return Err(e)
+        },
+        Err(e) => return Err(e)
+    }
+    state.program.n_stmt += 1;
+    Ok(state)
+}
+
+fn register_axiom(label: Label, typecode: String, symbols: Vec<String>, mut state: ParserState) -> Result<ParserState, String> {
+    match encode_typed_symbols(typecode, symbols, &state) {
+        Ok((typ, syms)) => {
+            state.program.axioms.insert(label, Assertion {
+                ax: TypedSymbols { typ: typ, syms: syms },
+                proof: None,
+                scope: state.scope.clone()
+            });
+        },
+        Err(e) => return Err(e)
+    }
+    Ok(state)
+}
+
+fn parse_axiom_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserState) -> Result<ParserState, String> {
+    match parse_typed_symbols_until(b, Token::EndStatement) {
+        Ok((typecode, symbols)) => match register_axiom(label, typecode, symbols, state) {
+            Ok(ns) => state = ns,
+            Err(e) => return Err(e)
+        },
+        Err(e) => return Err(e)
+    }
+    state.program.n_stmt += 1;
+    Ok(state)
+}
+
+fn register_provable(label: Label, typecode: String, symbols: Vec<String>, proof: Proof, mut state: ParserState) -> Result<ParserState, String> {
+    match encode_typed_symbols(typecode, symbols, &state) {
+        Ok((typ, syms)) => {
+            state.program.provables.insert(label, Assertion {
+                ax: TypedSymbols { typ: typ, syms: syms },
+                proof: Some(proof),
+                scope: state.scope.clone()
+            });
+        },
+        Err(e) => return Err(e)
+    }
+    Ok(state)
+}
+
+fn parse_compressed_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<Proof, String> {
+    let mut labels = vec![];
+    let mut chars = "".to_string();
+    match parse_symbol(b) {
+        Ok(s) => if s != "(" { return Err(format!("Unexpected token {}", s)) },
+        Err(e) => return Err(e)
+    }
+    loop {
+        skip_blanks(b);
+        match parse_label(b) {
+            Ok(l) => {
+                if l == "" { break }
+                if !state.program.labels.contains_key(&l) {
+                    return Err(format!("Label {} not defined.", l))
+                }
+                labels.push(state.program.labels[&l]);
+                continue
+            },
+            Err(e) => return Err(e)
+        }
+    }
+    match parse_symbol(b) {
+        Ok(s) => if s != ")" { return Err(format!("Unexpected token {}", s)) },
+        Err(e) => return Err(e)
+    }
+    loop {
+        skip_blanks(b);
+        match parse_label(b) {
+            Ok(l) => {
+                if l == "" { break }
+                chars.push_str(l.as_str());
+                continue
+            },
+            Err(e) => return Err(e)
+        }
+    }
+    match read_next_token(b) {
+        Ok(Token::EndStatement) => {},
+        Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
+        Err(e) => return Err(e)
+    }
+    Ok(Proof::Compressed { labels: labels, chars: chars })
+}
+
+fn parse_uncompressed_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<Proof, String> {
+    let mut labels = vec![];
     loop {
         skip_blanks(b);
         match read_next_token(b) {
             Ok(Token::EndStatement) => break,
-            Err(e) => return Err(e),
-            _ => b.i += 1  // TODO
+            Ok(Token::OtherNotRead) => {
+                match parse_symbol(b) {
+                    Ok(s) => {
+                        if s == "?" {
+                            labels.push(ProofStep::Unknown());
+                            continue
+                        }
+                        if !state.program.labels.contains_key(&s) {
+                            return Err(format!("Label {} not defined.", s))
+                        }
+                        labels.push(ProofStep::Label(state.program.labels[&s]));
+                        continue
+                    },
+                    Err(e) => return Err(e) } },
+            Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
+            Err(e) => return Err(e)
         }
+    }
+    Ok(Proof::Uncompressed { labels: labels })
+}
+
+fn parse_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<Proof, String> {
+    skip_blanks(b);
+    let start = b.i;
+    match parse_symbol(b) {
+        Ok(s) => {
+            b.i = start;  // rewind
+            if s == "(" {
+                return parse_compressed_proof(b, state)
+            }
+            else {
+                return parse_uncompressed_proof(b, state)
+            } },
+        Err(e) => return Err(e)
+    }
+}
+
+fn parse_provable_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserState) -> Result<ParserState, String> {
+    match parse_typed_symbols_until(b, Token::StartProof) {
+        Ok((typecode, symbols)) => match parse_proof(b, &state) {
+            Ok(proof) => match register_provable(label, typecode, symbols, proof, state) {
+                Ok(ns) => state = ns,
+                Err(e) => return Err(e) },
+            Err(e) => return Err(e) },
+        Err(e) => return Err(e)
     }
     state.program.n_stmt += 1;
     Ok(state)
@@ -473,8 +670,8 @@ fn parse_labeled_stmt(b: &mut ParseBuffer, mut state: ParserState) -> Result<Par
         match read_next_token(b) {
             Ok(Token::StartFloating) => return parse_floating_stmt(b, label, state),
             Ok(Token::StartEssential) => return parse_essential_stmt(b, label, state),
-            Ok(Token::StartAxiom) => return parse_xxx_stmt(b, state),
-            Ok(Token::StartProvable) => return parse_xxx_stmt(b, state),
+            Ok(Token::StartAxiom) => return parse_axiom_stmt(b, label, state),
+            Ok(Token::StartProvable) => return parse_provable_stmt(b, label, state),
             Ok(Token::OtherNotRead) => return Err(format!("Unexpected token {}", b.bytes[b.i] as char)),
             Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
             Err(e) => return Err(e)
@@ -492,7 +689,7 @@ fn parse_stmt(b: &mut ParseBuffer, state: ParserState) -> Result<ParserState, St
                 Err(e) => return Err(e)
             } },
         Ok(Token::StartVariable) => return parse_const_var_stmt(b, register_variable, state),
-        Ok(Token::StartDisjoint) => return parse_xxx_stmt(b, state),
+        Ok(Token::StartDisjoint) => return parse_disjoint_stmt(b, state),
         Ok(Token::OtherNotRead) => {},
         Ok(_) => b.i -= 2,  // rewind parsed token
         Err(e) => return Err(e),
@@ -536,7 +733,8 @@ fn parse_top_level(b: &mut ParseBuffer, mut state: ParserState) -> Result<Parser
         }
     }
     println!("{} bytes were read into the source buffer.", b.bytes.len());
-    println!("The source has {} statements;", state.program.n_stmt);
+    println!("The source has {} statements; {} are $a and {} are $p.",
+             state.program.n_stmt, state.program.axioms.len(), state.program.provables.len());
     Ok(state)
 }
 
@@ -576,7 +774,7 @@ fn parse_metamath(filename: &str) -> Result<(), String> {
     println!("{} constants", state.program.constants.len());
     println!("{} variables", state.program.variables.len());
     println!("{} labels", state.program.labels.len());
-    println!("Program parsed in {} msec", now.elapsed().subsec_millis());
+    println!("Program parsed in {:?}", now.elapsed());
     Ok(())
 }
 
