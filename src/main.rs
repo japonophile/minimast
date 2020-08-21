@@ -31,7 +31,10 @@ pub struct Scope {
 
 #[derive(Clone)]
 pub enum ProofStep {
-    Label(Label),
+    Floating(Label),
+    Essential(Label),
+    Axiom(Label),
+    Provable(Label),
     Save(),
     Load(usize),
     Unknown()
@@ -61,12 +64,12 @@ pub struct Program {
 
 pub struct ParserState {
     pub program: Program,
-    pub scope: Scope
+    pub scope: Scope,
 }
 
 pub struct ParseBuffer<'a> {
     pub bytes: &'a [u8],
-    pub i: usize
+    pub i: usize,
 }
 
 impl Clone for TypedSymbols {
@@ -579,7 +582,7 @@ fn parse_axiom_stmt(b: &mut ParseBuffer, label: Label, mut state: ParserState) -
     Ok(state)
 }
 
-pub fn decode_proof_chars(chars: &String, labels: &Vec<Label>, mhyps: &Vec<Label>) -> Proof {
+pub fn decode_proof_chars(chars: &String, labels: &Vec<Label>, mhyps: &Vec<Label>, state: &ParserState) -> Result<Proof, String> {
     let m = mhyps.len();
     let n = labels.len();
     let mut proof = vec![];
@@ -599,19 +602,19 @@ pub fn decode_proof_chars(chars: &String, labels: &Vec<Label>, mhyps: &Vec<Label
         }
         let i = (acc + ((c as u32) - 64)) as usize;
         if i <= m {
-            proof.push(ProofStep::Label(mhyps[i - 1]));
-            acc = 0;
-            continue
+            match get_label_proof_step(mhyps[i - 1], state) {
+                Ok(proofstep) => { proof.push(proofstep); acc = 0; continue },
+                Err(e) => return Err(e) }
         }
         if i <= m + n {
-            proof.push(ProofStep::Label(labels[i - m - 1]));
-            acc = 0;
-            continue
+            match get_label_proof_step(labels[i - m - 1], state) {
+                Ok(proofstep) => { proof.push(proofstep); acc = 0; continue },
+                Err(e) => return Err(e) }
         }
         proof.push(ProofStep::Load(i - m - n - 1));
         acc = 0;
     }
-    proof
+    Ok(proof)
 }
 
 fn parse_compressed_proof(b: &mut ParseBuffer, provable: &Assertion, state: &ParserState) -> Result<Proof, String> {
@@ -655,7 +658,23 @@ fn parse_compressed_proof(b: &mut ParseBuffer, provable: &Assertion, state: &Par
         Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
         Err(e) => return Err(e)
     }
-    Ok(decode_proof_chars(&chars, &labels, &provable.mhyps))
+    decode_proof_chars(&chars, &labels, &provable.mhyps, &state)
+}
+
+fn get_label_proof_step(label: Label, state: &ParserState) -> Result<ProofStep, String> {
+    if state.scope.floatings.contains_key(&label) {
+        return Ok(ProofStep::Floating(label))
+    }
+    if state.scope.essentials.contains_key(&label) {
+        return Ok(ProofStep::Essential(label))
+    }
+    if state.program.axioms.contains_key(&label) {
+        return Ok(ProofStep::Axiom(label))
+    }
+    if state.program.provables.contains_key(&label) {
+        return Ok(ProofStep::Provable(label))
+    }
+    Err(format!("Label {} not found in floatings, essentials, axioms or provables.", label))
 }
 
 fn parse_uncompressed_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<Proof, String> {
@@ -672,10 +691,12 @@ fn parse_uncompressed_proof(b: &mut ParseBuffer, state: &ParserState) -> Result<
                             continue
                         }
                         if !state.program.labels.contains_key(&s) {
-                            return Err(format!("Label {} not defined.", s))
+                            return Err(format!("Label {} not defined.", s));
                         }
-                        proof.push(ProofStep::Label(state.program.labels[&s]));
-                        continue
+                        let label = state.program.labels[&s];
+                        match get_label_proof_step(label, state) {
+                            Ok(proofstep) => { proof.push(proofstep); continue },
+                            Err(e) => return Err(e) }
                     },
                     Err(e) => return Err(e) } },
             Ok(_) => return Err(format!("Unexpected token ${}", b.bytes[b.i - 1] as char)),
@@ -827,7 +848,7 @@ fn parse_metamath(filename: &str) -> Result<(), String> {
     let program_text = fs::read_to_string(filename).expect("Could not read file");
     let mut b = ParseBuffer {
         bytes: program_text.as_bytes(),
-        i: 0
+        i: 0,
     };
     println!("{} bytes", b.bytes.len());
     match parse_top_level(&mut b, state) {
@@ -837,6 +858,7 @@ fn parse_metamath(filename: &str) -> Result<(), String> {
     // println!("Constants: {:?}", state.program.constants.keys());
     println!("{} constants", state.program.constants.len());
     println!("{} variables", state.program.variables.len());
+    println!("{} symbols", state.program.symbols.len());
     println!("{} labels", state.program.labels.len());
     println!("Program parsed in {:?}", now.elapsed());
     Ok(())
