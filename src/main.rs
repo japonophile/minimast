@@ -1,4 +1,5 @@
 use itertools::Itertools;
+use pbr::ProgressBar;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
@@ -20,6 +21,8 @@ pub struct TypedSymbols {
     pub typ: Constant,
     pub syms: Vec<Symbol>
 }
+
+type Substitutions = HashMap<Variable, Vec<Symbol>>;
 
 pub struct Scope {
     pub variables: HashSet<Variable>,
@@ -823,7 +826,7 @@ fn parse_top_level(b: &mut ParseBuffer, mut state: ParserState) -> Result<Parser
     Ok(state)
 }
 
-fn parse_metamath(filename: &str) -> Result<(), String> {
+fn parse_metamath(filename: &str) -> Result<Program, String> {
     let now = Instant::now();
     let mut state = ParserState {
         program: Program {
@@ -855,21 +858,192 @@ fn parse_metamath(filename: &str) -> Result<(), String> {
         Ok(ns) => state = ns,
         Err(e) => return Err(e)
     }
-    // println!("Constants: {:?}", state.program.constants.keys());
-    println!("{} constants", state.program.constants.len());
-    println!("{} variables", state.program.variables.len());
-    println!("{} symbols", state.program.symbols.len());
-    println!("{} labels", state.program.labels.len());
-    println!("Program parsed in {:?}", now.elapsed());
-    Ok(())
+    println!(" . Program parsed in {:?}", now.elapsed());
+    Ok(state.program)
+}
+
+fn apply_substitutions(subst: &Substitutions, syms: &Vec<Symbol>, constants: &HashSet<Constant>) -> Vec<Symbol> {
+    let mut subst_syms = vec![];
+    for s in syms {
+        if constants.contains(&s) {
+            subst_syms.push(*s);
+            continue;
+        }
+        subst_syms.extend(&subst[&s]);
+    }
+    subst_syms
+}
+
+fn find_substitutions(stack: &Vec<TypedSymbols>, mhyps: &Vec<Label>, scope: &Scope, constants: &HashSet<Constant>) -> Result<HashMap<Variable, Vec<Symbol>>, String> {
+    let mut subst = HashMap::new();
+    let mut i = stack.len() - mhyps.len();
+    for l in mhyps {
+        let target = &stack[i];
+        if scope.floatings.contains_key(&l) {
+            let f = &scope.floatings[&l];
+            if f.typ != target.typ {
+                return Err(format!("Incorrect type when trying to substitute variable \
+                                   '{}' by {:?} (got {}, expected {})",
+                                   f.var, target.syms, target.typ, f.typ));
+            }
+            subst.insert(f.var, target.syms.clone());
+        }
+        else if scope.essentials.contains_key(&l) {
+            let e = &scope.essentials[&l];
+            if e.typ != target.typ {
+                return Err(format!("Incorrect type for essential hypothesis \
+                                   '{}' (got {}, expected {})",
+                                   l, target.typ, e.typ));
+            }
+            let subst_syms = apply_substitutions(&subst, &e.syms, &constants);
+            if subst_syms != target.syms {
+                return Err(format!("Mismatch after substitution in essential hypothesis \
+                                   '{}' (got {:?}, expected {:?})",
+                                   l, target.syms, subst_syms));
+            }
+        }
+        i += 1;
+    }
+    Ok(subst)
+}
+
+fn are_expressions_disjoint(expr1: &Vec<Symbol>, expr2: &Vec<Symbol>, provable_vars: &HashSet<Variable>, provable_disjs: &HashSet<(Variable, Variable)>) -> bool {
+    let vars1 = expr1.into_iter().filter(|v| provable_vars.contains(&v)).collect_vec();
+    let vars2 = expr2.into_iter().filter(|v| provable_vars.contains(&v)).collect_vec();
+    let allpairs = vars2.iter().flat_map(|v2| vars1.iter().clone().map(move |v1| {
+        if v1 < v2 { (**v1, **v2) } else { (**v2, **v1) } }));
+    for vpair in allpairs {
+        if !provable_disjs.contains(&vpair) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_disjoint_restriction_verified(vpair: (Variable, Variable), mdisj: &HashSet<(Variable, Variable)>, provable_scope: &Scope, subst: &HashMap<Variable, Vec<Symbol>>) -> bool {
+    let (v1, v2) = vpair;
+    if mdisj.contains(&vpair) && subst.contains_key(&v1) && subst.contains_key(&v2) {
+        let (expr1, expr2) = (subst[&v1].to_vec(), subst[&v2].to_vec());
+        return are_expressions_disjoint(&expr1, &expr2, &provable_scope.variables, &provable_scope.disjoints);
+    }
+    true
+}
+
+fn are_disjoint_restrictions_verified(axiom: &Assertion, provable_scope: &Scope, subst: &HashMap<Variable, Vec<Symbol>>) -> bool {
+    let mut mvars = axiom.mvars.iter().collect_vec();
+    mvars.sort();
+    for (v1, v2) in mvars.iter().tuple_combinations() {
+        if !is_disjoint_restriction_verified((**v1, **v2), &axiom.mdisj, provable_scope, subst) {
+            return false;
+        }
+    }
+    true
+}
+
+fn apply_axiom(axiom: &Assertion, provable_scope: &Scope, program: &Program, mut stack: Vec<TypedSymbols>) -> Result<Vec<TypedSymbols>, String> {
+    if stack.len() < axiom.mhyps.len() {
+        return Err("Not enough items on the stack".to_string());
+    }
+    let n = stack.len() - axiom.mhyps.len();
+    let (remaining_stack, substack) = stack.split_at_mut(n);
+    match find_substitutions(&substack.to_vec(), &axiom.mhyps, &axiom.scope, &program.constants) {
+        Ok(subst) => {
+            if are_disjoint_restrictions_verified(axiom, provable_scope, &subst) {
+                let subst_syms = apply_substitutions(&subst, &axiom.ax.syms, &program.constants);
+                let mut new_stack = remaining_stack.to_vec();
+                new_stack.push(TypedSymbols { typ: axiom.ax.typ, syms: subst_syms });
+                Ok(new_stack)
+            }
+            else {
+                Err("Disjoint restriction violated".to_string())
+            }
+        },
+        Err(e) => Err(e)
+    }
+}
+
+fn verify_proof(provable: &Assertion, program: &Program) -> Result<(), String> {
+    let mut stack = vec![];
+    let mut memory = vec![];
+    let scope = &provable.scope;
+    let proof_labels;
+    match &provable.proof {
+        Some(labels) => proof_labels = labels,
+        None => return Err("Nothing to prove".to_string())
+    }
+    for label in proof_labels {
+        match label {
+            ProofStep::Floating(label) => {
+                let f = &scope.floatings[&label];
+                stack.push(TypedSymbols { typ: f.typ, syms: vec![f.var] });
+                continue },
+            ProofStep::Essential(label) => {
+                stack.push(scope.essentials[&label].clone());
+                continue },
+            ProofStep::Axiom(label) => {
+                match apply_axiom(&program.axioms[&label], scope, &program, stack) {
+                    Ok(updated_stack) => stack = updated_stack,
+                    Err(e) => return Err(e)
+                }
+                continue },
+            ProofStep::Provable(label) => {
+                match apply_axiom(&program.provables[&label], scope, &program, stack) {
+                    Ok(updated_stack) => stack = updated_stack,
+                    Err(e) => return Err(e)
+                }
+                continue },
+            ProofStep::Save() => {
+                memory.push(stack[stack.len() - 1].clone()); },
+            ProofStep::Load(i) => {
+                stack.push(memory[*i].clone()); },
+            ProofStep::Unknown() => continue
+        }
+    }
+    if stack.len() > 1 {
+        return Err("Too many items left in the stack".to_string());
+    }
+    match stack.pop() {
+        Some(proof_result) => {
+            if proof_result.typ != provable.ax.typ ||
+               proof_result.syms != provable.ax.syms {
+                return Err("Proof result does not match assertion".to_string());
+            }
+            return Ok(())
+        },
+        _ => {
+            return Err("No item left in the stack".to_string());
+        }
+    }
+}
+
+fn verify_proofs(program: &Program) -> bool {
+    let n = program.provables.len();
+    if n == 0 {
+        return true;
+    }
+    let now = Instant::now();
+    let mut pb = ProgressBar::new(n as u64);
+    pb.format("[=>-]");
+    println!("Verifying {} proofs...", n);
+    let result = program.provables.iter().all(|(l, p)| {
+        match verify_proof(p, program) {
+            Ok(()) => { pb.inc(); true },
+            Err(e) => { println!(" Proof {} verification FAILED ({})", l, e); false }
+        }
+    });
+    pb.finish_print(format!(" . Proofs verified in {} seconds.", now.elapsed().as_secs()).as_str());
+    result
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     let filename = &args[1];
     match parse_metamath(filename.as_str()) {
-        Ok(_) => println!("OK"),
+        Ok(program) => {
+            println!("OK");
+            verify_proofs(&program);
+            println!("Done");
+        },
         Err(e) => println!("Error: {}", e)
     }
-    println!("Done");
 }
